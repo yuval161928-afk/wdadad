@@ -1,4 +1,11 @@
-name: Build IPA (auto-generate Xcode project)
+name: Build IPA (ROM from Drive + optional signing)
+
+# Secrets used (create them under Settings > Secrets and variables > Actions):
+#   ROM_DRIVE_URL        Google Drive share link to the ROM file ("Anyone with the link")
+#   CERT_P12_BASE64      base64 of your signing certificate (.p12)        [optional]
+#   CERT_PASSWORD        password of the .p12                              [optional]
+#   PROFILE_BASE64       base64 of your .mobileprovision profile           [optional]
+# If the certificate/profile secrets are missing, an unsigned IPA is built.
 
 on:
   push:
@@ -8,19 +15,15 @@ on:
       app_name:
         description: "App name"
         required: false
-        default: "Legen of Zelda: ToTK"
-      bundle_id:
-        description: "Bundle identifier"
-        required: false
-        default: "com.Switch.ZeldaToTK"
+        default: "ROMApp"
 
 env:
   APP_NAME: ${{ github.event.inputs.app_name || 'ROMApp' }}
-  BUNDLE_ID: ${{ github.event.inputs.bundle_id || 'com.example.romapp' }}
+  DEFAULT_BUNDLE_ID: com.example.romapp
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-latest
 
     steps:
       - name: Checkout
@@ -28,8 +31,80 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Download ROM from Google Drive
+        env:
+          ROM_DRIVE_URL: ${{ secrets.ROM_DRIVE_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ROM_DRIVE_URL:-}" ]; then
+            echo "No ROM_DRIVE_URL secret set, skipping ROM download."
+            exit 0
+          fi
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q gdown
+          mkdir -p rom
+          # output is silenced so the resolved link is never printed to the log
+          if ! "$RUNNER_TEMP/venv/bin/gdown" -q --fuzzy "$ROM_DRIVE_URL" -O rom/ >/dev/null 2>&1; then
+            echo "::error::ROM download failed. Use a single-file link shared as 'Anyone with the link'."
+            exit 1
+          fi
+          ls -lh rom
+
+      - name: Prepare signing (only if secrets are set)
+        env:
+          CERT_P12_BASE64: ${{ secrets.CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
+          PROFILE_BASE64: ${{ secrets.PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          echo "FINAL_BUNDLE_ID=${DEFAULT_BUNDLE_ID}" >> "$GITHUB_ENV"
+
+          if [ -z "${CERT_P12_BASE64:-}" ] || [ -z "${PROFILE_BASE64:-}" ]; then
+            echo "Signing secrets not set, building unsigned."
+            exit 0
+          fi
+
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KC_PASS="$(uuidgen)"
+
+          echo "$CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          echo "$PROFILE_BASE64"  | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
+
+          security create-keychain -p "$KC_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KC_PASS" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -P "${CERT_PASSWORD:-}" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KC_PASS" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | awk 'NR==1{print $2}')
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::No signing identity found in the .p12. Check CERT_P12_BASE64 and CERT_PASSWORD."
+            exit 1
+          fi
+
+          security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+          /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' "$RUNNER_TEMP/profile.plist" > "$RUNNER_TEMP/entitlements.plist"
+
+          APPID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$RUNNER_TEMP/profile.plist")
+          TEAM=$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$RUNNER_TEMP/profile.plist")
+          BUNDLE="${APPID#${TEAM}.}"
+          if [[ "$BUNDLE" != *"*"* ]]; then
+            echo "FINAL_BUNDLE_ID=${BUNDLE}" >> "$GITHUB_ENV"
+          fi
+
+          {
+            echo "SIGN_IDENTITY=${IDENTITY}"
+            echo "PROFILE_PATH=${RUNNER_TEMP}/profile.mobileprovision"
+            echo "ENT_PATH=${RUNNER_TEMP}/entitlements.plist"
+            echo "KEYCHAIN_PATH=${KEYCHAIN}"
+          } >> "$GITHUB_ENV"
+          echo "Signing prepared."
+
       - name: Install XcodeGen
-        run: brew install xcodegen
+        run: |
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          brew install xcodegen
 
       - name: Generate Xcode project (skipped if one already exists)
         run: |
@@ -40,7 +115,6 @@ jobs:
             exit 0
           fi
 
-          # 1) Sources: use your own Swift files in Sources/, otherwise create a minimal SwiftUI app
           if [ -d Sources ] && find Sources -name '*.swift' | grep -q .; then
             echo "Using Swift sources from ./Sources"
           else
@@ -75,14 +149,12 @@ jobs:
           EOF
           fi
 
-          # 2) Bundle everything in ./rom as a folder reference (optional)
           ROM_BLOCK=""
           if [ -d rom ]; then
             ROM_BLOCK="      - path: rom
                   type: folder"
           fi
 
-          # 3) XcodeGen spec
           cat > project.yml <<EOF
           name: ${APP_NAME}
           options:
@@ -97,7 +169,7 @@ jobs:
           ${ROM_BLOCK}
               settings:
                 base:
-                  PRODUCT_BUNDLE_IDENTIFIER: ${BUNDLE_ID}
+                  PRODUCT_BUNDLE_IDENTIFIER: ${FINAL_BUNDLE_ID}
                   PRODUCT_NAME: ${APP_NAME}
                   GENERATE_INFOPLIST_FILE: YES
                   MARKETING_VERSION: "1.0"
@@ -110,8 +182,6 @@ jobs:
                   SWIFT_VERSION: "5.0"
           EOF
 
-          echo "---- project.yml ----"
-          cat project.yml
           xcodegen generate
 
       - name: Detect project and scheme
@@ -134,9 +204,8 @@ jobs:
           echo "flag=$FLAG"        >> "$GITHUB_OUTPUT"
           echo "path=$TARGET_PATH" >> "$GITHUB_OUTPUT"
           echo "scheme=$SCHEME"    >> "$GITHUB_OUTPUT"
-          echo "Using $FLAG $TARGET_PATH, scheme '$SCHEME'"
 
-      - name: Build (unsigned)
+      - name: Build (unsigned, signing is applied afterwards)
         run: |
           set -euo pipefail
           xcodebuild \
@@ -151,7 +220,7 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             build | tee build.log | tail -n 50
 
-      - name: Package IPA
+      - name: Sign (if configured) and package IPA
         run: |
           set -euo pipefail
           APP=$(find build/Build/Products -maxdepth 2 -name "*.app" -path "*iphoneos*" | head -n 1)
@@ -159,6 +228,16 @@ jobs:
             echo "::error::No .app produced. Check the build log."
             exit 1
           fi
+
+          if [ -n "${SIGN_IDENTITY:-}" ]; then
+            echo "Signing app"
+            cp "$PROFILE_PATH" "$APP/embedded.mobileprovision"
+            codesign --force --sign "$SIGN_IDENTITY" --entitlements "$ENT_PATH" --timestamp=none "$APP"
+            codesign --verify --deep --strict "$APP"
+          else
+            echo "No signing configured, packaging unsigned."
+          fi
+
           NAME=$(basename "$APP" .app)
           rm -rf Payload && mkdir Payload
           cp -R "$APP" Payload/
@@ -172,12 +251,18 @@ jobs:
           path: "*.ipa"
           if-no-files-found: error
 
-      - name: Upload generated project and log (on failure)
+      - name: Upload build log (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: debug
-          path: |
-            build.log
-            project.yml
+          name: build-log
+          path: build.log
           if-no-files-found: ignore
+
+      - name: Remove signing keychain
+        if: always()
+        run: |
+          if [ -n "${KEYCHAIN_PATH:-}" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/profile.mobileprovision"
