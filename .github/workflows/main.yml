@@ -1,0 +1,119 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      scheme:
+        description: "Xcode scheme (leave empty to auto-detect)"
+        required: false
+        default: ""
+      configuration:
+        description: "Build configuration"
+        required: false
+        default: "Release"
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Show Xcode version
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install CocoaPods dependencies (if any)
+        run: |
+          if [ -f Podfile ]; then
+            pod install
+          else
+            echo "No Podfile, skipping"
+          fi
+
+      - name: Detect project, workspace and scheme
+        id: detect
+        run: |
+          set -euo pipefail
+
+          WORKSPACE=$(find . -maxdepth 3 -name "*.xcworkspace" -not -path "*/Pods/*" -not -path "*/.build/*" -not -path "*xcodeproj/*" | head -n 1 || true)
+          PROJECT=$(find . -maxdepth 3 -name "*.xcodeproj" -not -path "*/Pods/*" | head -n 1 || true)
+
+          if [ -n "$WORKSPACE" ]; then
+            TARGET_FLAG="-workspace"
+            TARGET_PATH="$WORKSPACE"
+            SCHEME_KEY="workspace"
+          elif [ -n "$PROJECT" ]; then
+            TARGET_FLAG="-project"
+            TARGET_PATH="$PROJECT"
+            SCHEME_KEY="project"
+          else
+            echo "::error::No .xcworkspace or .xcodeproj found in the repository."
+            exit 1
+          fi
+
+          SCHEME="${{ github.event.inputs.scheme }}"
+          if [ -z "$SCHEME" ]; then
+            SCHEME=$(xcodebuild -list -json "$TARGET_FLAG" "$TARGET_PATH" | jq -r ".${SCHEME_KEY}.schemes[0]")
+          fi
+
+          echo "flag=$TARGET_FLAG"  >> "$GITHUB_OUTPUT"
+          echo "path=$TARGET_PATH"  >> "$GITHUB_OUTPUT"
+          echo "scheme=$SCHEME"     >> "$GITHUB_OUTPUT"
+          echo "Using $TARGET_FLAG $TARGET_PATH with scheme '$SCHEME'"
+
+      - name: Build (unsigned)
+        run: |
+          set -euo pipefail
+          CONFIG="${{ github.event.inputs.configuration }}"
+          CONFIG="${CONFIG:-Release}"
+
+          xcodebuild \
+            ${{ steps.detect.outputs.flag }} "${{ steps.detect.outputs.path }}" \
+            -scheme "${{ steps.detect.outputs.scheme }}" \
+            -configuration "$CONFIG" \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build | tee build.log | tail -n 50
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP=$(find build/Build/Products -maxdepth 2 -name "*.app" -path "*iphoneos*" | head -n 1)
+          if [ -z "$APP" ]; then
+            echo "::error::No .app produced. Check the build log."
+            exit 1
+          fi
+          echo "Found app: $APP"
+
+          NAME=$(basename "$APP" .app)
+          rm -rf Payload
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry "${NAME}.ipa" Payload
+          ls -lh "${NAME}.ipa"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa
+          path: "*.ipa"
+          if-no-files-found: error
+
+      - name: Upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
