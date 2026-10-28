@@ -8,11 +8,11 @@ on:
       app_name:
         description: "App name"
         required: false
-        default: "ROMApp"
+        default: "Legen of Zelda: ToTK"
       bundle_id:
         description: "Bundle identifier"
         required: false
-        default: "com.example.romapp"
+        default: "com.Switch.ZeldaToTK"
 
 env:
   APP_NAME: ${{ github.event.inputs.app_name || 'ROMApp' }}
@@ -20,7 +20,7 @@ env:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-14
 
     steps:
       - name: Checkout
